@@ -1,48 +1,42 @@
 # Suno MCP Server - Docker Image
-# Multi-stage build for optimal security and size
 
-# Use official Python 3.12 slim image as base
 FROM python:3.12-slim
 
-# Set environment variables for Python optimization
-# PYTHONDONTWRITEBYTECODE: Prevents Python from writing pyc files
-# PYTHONUNBUFFERED: Ensures logs aren't buffered (prevents silent crashes)
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Set working directory
 WORKDIR /app
 
-# Create a non-root user for security
-# Running as non-root minimizes security risks
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+        | gpg --dearmor -o /usr/share/keyrings/ngrok.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/ngrok.gpg] https://ngrok-agent.s3.amazonaws.com buster main" \
+        > /etc/apt/sources.list.d/ngrok.list \
+    && apt-get update && apt-get install -y ngrok \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
 
-# Copy requirements first for better layer caching
-# This allows Docker to reuse this layer when only code changes
 COPY --chown=appuser:appuser requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
 COPY --chown=appuser:appuser server.py .
 COPY --chown=appuser:appuser suno_client.py .
 COPY --chown=appuser:appuser callback_server.py .
 COPY --chown=appuser:appuser callback_store.py .
 COPY --chown=appuser:appuser suno_response.py .
+COPY --chown=appuser:appuser ngrok_tunnel.py .
 COPY --chown=appuser:appuser healthcheck.py .
+COPY --chown=appuser:appuser docker-entrypoint.sh .
+
+RUN chmod +x docker-entrypoint.sh
 
 EXPOSE 8090
 
-# Switch to non-root user
 USER appuser
 
-# Add healthcheck to monitor container status
-# Checks every 30s, with 5s timeout, 3 retries before unhealthy
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python healthcheck.py || exit 1
 
-# Set the entrypoint to run the MCP server
-# The server communicates via stdio (stdin/stdout)
-ENTRYPOINT ["python", "server.py"]
+ENTRYPOINT ["./docker-entrypoint.sh"]
