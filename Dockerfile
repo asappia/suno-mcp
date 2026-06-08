@@ -28,7 +28,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY --chown=appuser:appuser server.py .
 COPY --chown=appuser:appuser suno_client.py .
+COPY --chown=appuser:appuser callback_server.py .
+COPY --chown=appuser:appuser callback_store.py .
+COPY --chown=appuser:appuser suno_response.py .
 COPY --chown=appuser:appuser healthcheck.py .
+
+EXPOSE 8090
 
 # Switch to non-root user
 USER appuser

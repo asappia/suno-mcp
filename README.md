@@ -118,6 +118,8 @@ Claude Desktop is the official desktop application for Claude that supports MCP 
 
 #### Docker Configuration (Recommended)
 
+The MCP server starts a built-in webhook receiver on port **8090** and automatically supplies a `callBackUrl` to Suno. Publish that port in Docker and optionally set a public URL so Suno can deliver callbacks.
+
 1. Locate your Claude Desktop configuration file:
    - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
    - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
@@ -134,6 +136,8 @@ Claude Desktop is the official desktop application for Claude that supports MCP 
         "run",
         "--rm",
         "-i",
+        "-p",
+        "8090:8090",
         "--env-file",
         "/absolute/path/to/.env",
         "ghcr.io/codekeanu/suno-mcp:latest"
@@ -142,6 +146,17 @@ Claude Desktop is the official desktop application for Claude that supports MCP 
   }
 }
 ```
+
+3. Optional: expose callbacks to Suno with a public tunnel (recommended for live webhook delivery):
+
+```bash
+# In .env
+SUNO_CALLBACK_PUBLIC_URL=https://your-subdomain.ngrok-free.app
+```
+
+Point ngrok (or similar) at `http://localhost:8090`. Suno will POST completion events to `https://your-subdomain.ngrok-free.app/api/suno/callback`.
+
+If you skip the public URL, generation still works via built-in polling when `wait_audio=true`.
 
 **Example paths:**
 - macOS: `/Users/yourusername/suno-mcp-config/.env`

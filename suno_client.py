@@ -1,15 +1,37 @@
 """Suno API Client for music generation."""
 
+import asyncio
 import httpx
-from typing import Optional, Dict, Any, List
 import os
 import re
+import time
+from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
+
+from callback_server import resolve_callback_url, validate_callback_url
+from suno_response import (
+    extract_generation_task_id,
+    extract_tracks_from_container,
+    is_terminal_failure,
+    is_terminal_success,
+)
 
 
 class SunoAPIError(Exception):
     """Base exception for Suno API errors."""
     pass
+
+
+MODEL_VERSION_MAP = {
+    "v4": "V4",
+    "v4.5": "V4_5",
+    "v4.5plus": "V4_5PLUS",
+    "v4.5all": "V4_5ALL",
+    "v5": "V5",
+    "v5.5": "V5_5",
+}
+
+DEFAULT_MODEL_VERSION = "V5"
 
 
 class SunoClient:
@@ -41,53 +63,67 @@ class SunoClient:
         """Close the HTTP client."""
         await self.client.aclose()
 
+    @staticmethod
+    def map_model_version(model_version: str) -> str:
+        return MODEL_VERSION_MAP.get(model_version.lower(), DEFAULT_MODEL_VERSION)
+
+    @staticmethod
+    def resolve_callback_url(callback_url: Optional[str] = None) -> str:
+        url = resolve_callback_url(callback_url)
+        validate_callback_url(url)
+        return url
+
     async def generate_music(
         self,
         prompt: Optional[str] = None,
         make_instrumental: bool = False,
-        model_version: str = "V3_5",
-        wait_audio: bool = True,
+        model_version: str = DEFAULT_MODEL_VERSION,
         custom_mode: bool = False,
         style: Optional[str] = None,
         title: Optional[str] = None,
         callback_url: Optional[str] = None,
         persona_id: Optional[str] = None,
+        persona_model: Optional[str] = None,
         negative_tags: Optional[str] = None,
         vocal_gender: Optional[str] = None,
         style_weight: Optional[float] = None,
         weirdness_constraint: Optional[float] = None,
-        audio_weight: Optional[float] = None
+        audio_weight: Optional[float] = None,
+        wait_audio: bool = False,
+        callback_store: Optional[Any] = None,
+        poll_interval: float = 10.0,
+        max_wait: float = 600.0,
     ) -> Dict[str, Any]:
         """
         Generate music from a text prompt.
 
         Args:
-            prompt: Text description/lyrics for the music. In Custom Mode with instrumental=False,
-                   this is used as exact lyrics (max 3000-5000 chars depending on model).
-                   In Non-custom Mode, used as core idea for auto-generated lyrics (max 500 chars).
-                   Not required if custom_mode=True and make_instrumental=True.
+            prompt: Text description/lyrics for the music.
             make_instrumental: If True, generate instrumental only (no vocals)
-            model_version: AI model version (V3_5, V4, V4_5, V4_5PLUS, or V5). Defaults to V3_5.
-            wait_audio: If True, wait for audio generation to complete
+            model_version: AI model version (V4, V4_5, V4_5PLUS, V4_5ALL, V5, V5_5)
             custom_mode: If True, use custom mode (requires style and title; prompt required if not instrumental)
-            style: Music style/genre (required in Custom Mode). Max 200-1000 chars depending on model.
-            title: Song title (required in Custom Mode). Max 80 characters.
-            callback_url: Webhook URL for completion notification (required by API)
+            style: Music style/genre (required in Custom Mode)
+            title: Song title (required in Custom Mode)
+            callback_url: Webhook URL for completion notification (auto-resolved if omitted)
             persona_id: Persona identifier for stylistic influence (Custom Mode only)
+            persona_model: Persona type (`style_persona` or `voice_persona`)
             negative_tags: Styles/traits to exclude from generation
             vocal_gender: Preferred vocal gender ('m' or 'f')
             style_weight: Weight of style guidance (0.00-1.00)
             weirdness_constraint: Creative deviation tolerance (0.00-1.00)
             audio_weight: Input audio influence weighting (0.00-1.00)
+            wait_audio: Poll until generation completes before returning
+            callback_store: Optional callback store for webhook-driven completion
+            poll_interval: Seconds between status polls when wait_audio is True
+            max_wait: Maximum seconds to wait for generation
 
         Returns:
-            Dictionary containing generation task info and results
+            Dictionary containing generation task info and optional completed tracks
 
         Raises:
             SunoAPIError: If the API request fails
             ValueError: If required parameters are missing or invalid
         """
-        # Validate custom mode requirements
         if custom_mode:
             if not style:
                 raise ValueError("style must be provided when custom_mode is True")
@@ -96,34 +132,30 @@ class SunoClient:
             if not make_instrumental and not prompt:
                 raise ValueError("prompt must be provided when custom_mode is True and instrumental is False")
 
-        # Validate non-custom mode requirements
         if not custom_mode and not prompt:
             raise ValueError("prompt is required in non-custom mode")
 
-        # Build payload with required parameters
+        resolved_callback_url = self.resolve_callback_url(callback_url)
+
         payload: Dict[str, Any] = {
             "instrumental": make_instrumental,
             "model": model_version,
-            "wait_audio": wait_audio,
-            "customMode": custom_mode
+            "customMode": custom_mode,
+            "callBackUrl": resolved_callback_url,
         }
 
-        # Add prompt if provided
         if prompt:
             payload["prompt"] = prompt
 
-        # Add custom mode parameters
         if custom_mode:
             payload["style"] = style
             payload["title"] = title
 
-        # Add callback URL (required by API)
-        if callback_url:
-            payload["callBackUrl"] = callback_url
-
-        # Add optional parameters if provided
         if persona_id:
             payload["personaId"] = persona_id
+
+        if persona_model in ("style_persona", "voice_persona"):
+            payload["personaModel"] = persona_model
 
         if negative_tags:
             payload["negativeTags"] = negative_tags
@@ -145,14 +177,73 @@ class SunoClient:
             response.raise_for_status()
             result = response.json()
 
-            # Check for API-level errors (Suno returns HTTP 200 with error codes in JSON)
             if isinstance(result, dict) and result.get("code") != 200:
                 error_msg = result.get("msg", "Unknown error")
                 raise SunoAPIError(f"API Error (code {result.get('code')}): {error_msg}")
 
+            if wait_audio:
+                task_id = extract_generation_task_id(result)
+                if not task_id:
+                    raise SunoAPIError("Generation started but no taskId was returned")
+
+                completed = await self.wait_for_task_completion(
+                    task_id=task_id,
+                    callback_store=callback_store,
+                    poll_interval=poll_interval,
+                    max_wait=max_wait,
+                )
+                completed_data = completed.get("data", {})
+                tracks = extract_tracks_from_container(completed_data)
+                result = {
+                    **result,
+                    "data": {
+                        "taskId": task_id,
+                        "status": completed_data.get("status"),
+                        "tracks": tracks,
+                    },
+                }
+
             return result
         except httpx.HTTPError as e:
             raise SunoAPIError(f"Failed to generate music: {str(e)}")
+
+    async def wait_for_task_completion(
+        self,
+        task_id: str,
+        callback_store: Optional[Any] = None,
+        poll_interval: float = 10.0,
+        max_wait: float = 600.0,
+    ) -> Dict[str, Any]:
+        """Poll task status until generation completes or fails."""
+        deadline = time.monotonic() + max_wait
+
+        while time.monotonic() < deadline:
+            if callback_store is not None:
+                callback_payload = callback_store.get(task_id)
+                if callback_payload is not None:
+                    callback_data = callback_payload.get("data", {})
+                    callback_type = (callback_data.get("callbackType") or "").lower()
+                    if callback_type in ("complete", "first"):
+                        status_result = await self.get_task_status(task_id)
+                        status_data = status_result.get("data", {})
+                        if is_terminal_success(status_data.get("status"), extract_tracks_from_container(status_data)):
+                            return status_result
+
+            result = await self.get_task_status(task_id)
+            data = result.get("data", {})
+            status = data.get("status")
+            tracks = extract_tracks_from_container(data)
+
+            if is_terminal_failure(status):
+                error_message = data.get("errorMessage") or data.get("msg") or status
+                raise SunoAPIError(f"Generation failed: {error_message}")
+
+            if is_terminal_success(status, tracks):
+                return result
+
+            await asyncio.sleep(poll_interval)
+
+        raise SunoAPIError(f"Generation timeout after {max_wait} seconds for task {task_id}")
 
     async def get_task_status(self, task_id: str) -> Dict[str, Any]:
         """
@@ -175,7 +266,6 @@ class SunoClient:
             response.raise_for_status()
             result = response.json()
 
-            # Check for API-level errors
             if isinstance(result, dict) and result.get("code") != 200:
                 error_msg = result.get("msg", "Unknown error")
                 raise SunoAPIError(f"API Error (code {result.get('code')}): {error_msg}")
@@ -198,7 +288,6 @@ class SunoClient:
             SunoAPIError: If the API request fails
         """
         try:
-            # Join IDs with commas for query parameter
             ids_param = ",".join(ids)
             response = await self.client.get(
                 "/api/v1/generate/record-info",
@@ -207,7 +296,6 @@ class SunoClient:
             response.raise_for_status()
             result = response.json()
 
-            # Check for API-level errors
             if isinstance(result, dict) and result.get("code") != 200:
                 error_msg = result.get("msg", "Unknown error")
                 raise SunoAPIError(f"API Error (code {result.get('code')}): {error_msg}")
@@ -231,7 +319,6 @@ class SunoClient:
             response.raise_for_status()
             result = response.json()
 
-            # Check for API-level errors
             if isinstance(result, dict) and result.get("code") != 200:
                 error_msg = result.get("msg", "Unknown error")
                 raise SunoAPIError(f"API Error (code {result.get('code')}): {error_msg}")
@@ -242,9 +329,9 @@ class SunoClient:
 
     async def convert_to_wav(
         self,
-        callback_url: str,
         task_id: str,
-        audio_id: str
+        audio_id: str,
+        callback_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Convert a generated audio track to WAV format.
@@ -263,24 +350,8 @@ class SunoClient:
         Raises:
             SunoAPIError: If the API request fails
             ValueError: If required parameters are missing or invalid
-
-        Example:
-            # Generate music and wait for completion
-            music = await client.generate_music(prompt="Epic soundtrack", wait_audio=True)
-
-            # Extract BOTH IDs (both required for WAV conversion)
-            gen_task_id = music['data']['taskId']           # Generation job ID
-            track_id = music['data']['sunoData'][0]['id']   # Specific track ID
-
-            # Convert to WAV (requires both IDs)
-            conversion = await client.convert_to_wav(
-                callback_url="https://example.com/webhook",
-                task_id=gen_task_id,
-                audio_id=track_id
-            )
         """
-        if not callback_url:
-            raise ValueError("callback_url is required for WAV conversion")
+        resolved_callback_url = self.resolve_callback_url(callback_url)
 
         if not task_id:
             raise ValueError("task_id is required for WAV conversion (generation job ID)")
@@ -288,36 +359,18 @@ class SunoClient:
         if not audio_id:
             raise ValueError("audio_id is required for WAV conversion (specific track ID)")
 
-        # Validate callback_url format
-        if callback_url:
-            parsed = urlparse(callback_url)
-            if not parsed.scheme or not parsed.netloc:
-                raise ValueError(
-                    f"Invalid callback_url format: '{callback_url}'. "
-                    "Must be a valid URL like 'https://example.com/webhook'"
-                )
-            if parsed.scheme not in ['http', 'https']:
-                raise ValueError(
-                    f"Invalid callback_url scheme: '{parsed.scheme}'. "
-                    "Must use http:// or https://"
-                )
+        uuid_pattern = re.compile(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            re.IGNORECASE,
+        )
+        if not uuid_pattern.match(audio_id):
+            raise ValueError(
+                f"Invalid audio_id format: '{audio_id}'. "
+                f"Expected UUID format like '7752c889-3601-4e55-b805-54a28a53de85'. "
+                f"This is the track's 'id' field from sunoData array, NOT the generation taskId. "
+                f"If you have a taskId (hex string without dashes), use the task_id parameter instead."
+            )
 
-        # Validate audio_id format (should be UUID)
-        if audio_id:
-            # UUID format: 8-4-4-4-12 hex characters
-            uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
-            if not uuid_pattern.match(audio_id):
-                raise ValueError(
-                    f"Invalid audio_id format: '{audio_id}'. "
-                    f"Expected UUID format like '7752c889-3601-4e55-b805-54a28a53de85'. "
-                    f"This is the track's 'id' field from sunoData array, NOT the generation taskId. "
-                    f"If you have a taskId (hex string without dashes), use the task_id parameter instead."
-                )
-
-        # Validate task_id format (should be hex string without dashes, or could have dashes)
-        # Task IDs are typically hex strings (with or without dashes)
-        # If user accidentally passes a UUID here, warn them
-        uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
         if uuid_pattern.match(task_id):
             raise ValueError(
                 f"Possible parameter error: task_id '{task_id}' looks like a UUID (track ID). "
@@ -325,9 +378,8 @@ class SunoClient:
                 f"Check that you're using task_id from music['data']['taskId'], not from sunoData[]['id']"
             )
 
-        # Build payload - BOTH IDs are required per API documentation
         payload: Dict[str, Any] = {
-            "callBackUrl": callback_url,
+            "callBackUrl": resolved_callback_url,
             "taskId": task_id,
             "audioId": audio_id
         }
@@ -337,14 +389,10 @@ class SunoClient:
             response.raise_for_status()
             result = response.json()
 
-            # Check for API-level errors (Suno returns HTTP 200 with error codes in JSON)
             if isinstance(result, dict):
                 code = result.get("code")
 
-                # 409 = WAV already exists - this is informational, not an error
                 if code == 409:
-                    # WAV already exists - provide helpful message with the original conversion task ID
-                    # Note: We don't have the original conversion task ID, so user needs to retrieve it
                     raise SunoAPIError(
                         f"WAV conversion already exists for this track (code 409). "
                         f"The track audio_id '{audio_id}' has already been converted to WAV. "
@@ -385,7 +433,6 @@ class SunoClient:
             response.raise_for_status()
             result = response.json()
 
-            # Check for API-level errors
             if isinstance(result, dict) and result.get("code") != 200:
                 error_msg = result.get("msg", "Unknown error")
                 raise SunoAPIError(f"API Error (code {result.get('code')}): {error_msg}")
