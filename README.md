@@ -147,16 +147,18 @@ The MCP server starts a built-in webhook receiver on port **8090** and automatic
 }
 ```
 
-3. Optional: expose callbacks to Suno with a public tunnel (recommended for live webhook delivery):
+3. Optional: enable automatic ngrok in Docker (recommended for live webhooks):
 
 ```bash
 # In .env
-SUNO_CALLBACK_PUBLIC_URL=https://your-subdomain.ngrok-free.app
+NGROK_AUTHTOKEN=your_ngrok_authtoken_here
 ```
 
-Point ngrok (or similar) at `http://localhost:8090`. Suno will POST completion events to `https://your-subdomain.ngrok-free.app/api/suno/callback`.
+When `NGROK_AUTHTOKEN` is set and `SUNO_CALLBACK_PUBLIC_URL` is empty, the container starts ngrok automatically and registers a public callback URL with Suno. Get a free token from [ngrok dashboard](https://dashboard.ngrok.com/get-started/your-authtoken). With auto-ngrok, you do not need to publish port `8090` to the host for Suno callbacks.
 
-If you skip the public URL, generation still works via built-in polling when `wait_audio=true`.
+Manual alternative: run ngrok on the host and set `SUNO_CALLBACK_PUBLIC_URL=https://your-subdomain.ngrok-free.app` yourself.
+
+If you skip both, generation still works via built-in polling when `wait_audio=true`.
 
 **Example paths:**
 - macOS: `/Users/yourusername/suno-mcp-config/.env`
