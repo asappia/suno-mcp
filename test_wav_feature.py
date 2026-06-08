@@ -21,7 +21,10 @@ def test_client_methods():
         'get_credits',
         'get_music_info',
         'get_task_status',
-        'get_wav_conversion_status'
+        'get_wav_conversion_status',
+        'map_model_version',
+        'resolve_callback_url',
+        'wait_for_task_completion',
     ]
 
     actual_methods = [
@@ -47,7 +50,7 @@ def test_method_signatures():
     # Test convert_to_wav signature
     sig = inspect.signature(SunoClient.convert_to_wav)
     params = list(sig.parameters.keys())
-    expected_params = ['self', 'callback_url', 'task_id', 'audio_id']
+    expected_params = ['self', 'task_id', 'audio_id', 'callback_url']
 
     if params == expected_params:
         print(f"  ✓ convert_to_wav signature correct: {params}")

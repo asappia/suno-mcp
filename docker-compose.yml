@@ -28,6 +28,9 @@ services:
     stdin_open: true
     tty: false
 
+    ports:
+      - "8090:8090"
+
     # Restart policy (no restart for MCP servers managed by client)
     restart: "no"
 

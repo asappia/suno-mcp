@@ -37,7 +37,7 @@ async def test_non_custom_mode():
 
     result = await client.generate_music(
         prompt="A peaceful ambient soundscape with soft synths and gentle melodies",
-        model_version="V3_5",
+        model_version="V5",
         wait_audio=False,
         callback_url="https://example.com/webhook"
     )
@@ -154,7 +154,7 @@ async def test_multiple_models():
     print("TEST 5: Multiple Model Versions")
     print("=" * 70)
 
-    models = ["V3_5", "V4", "V4_5", "V4_5PLUS", "V5"]
+    models = ["V4", "V4_5", "V4_5PLUS", "V4_5ALL", "V5", "V5_5"]
 
     for model in models:
         print(f"\n  Testing model: {model}")

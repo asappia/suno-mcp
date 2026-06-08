@@ -42,9 +42,8 @@ async def test_mcp_tools():
 
         gen_args = {
             "prompt": "A short test melody",
-            "model_version": "v3.5",
+            "model_version": "v5",
             "wait_audio": False,
-            "callback_url": "https://example.com/webhook/test"
         }
 
         result = await handle_call_tool("generate_music", gen_args)
@@ -97,7 +96,6 @@ async def test_mcp_tools():
             "custom_mode": True,
             "vocal_gender": "f",
             "wait_audio": False,
-            "callback_url": "https://example.com/webhook/test"
         }
 
         result = await handle_call_tool("generate_music", custom_args)

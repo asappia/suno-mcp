@@ -3,7 +3,8 @@
 
 import asyncio
 import os
-from typing import Any
+from typing import Any, Optional
+
 from dotenv import load_dotenv
 
 from mcp.server.models import InitializationOptions
@@ -16,7 +17,10 @@ from mcp.types import (
     EmbeddedResource,
 )
 
+from callback_server import resolve_callback_url, start_callback_server
+from callback_store import CallbackStore
 from suno_client import SunoClient, SunoAPIError
+from suno_response import extract_generation_task_id, extract_tracks_from_container, normalize_track
 
 # Load environment variables
 load_dotenv()
@@ -24,8 +28,51 @@ load_dotenv()
 # Initialize server
 server = Server("suno-mcp-server")
 
-# Global client instance
+# Global client and callback infrastructure
 suno_client: SunoClient | None = None
+callback_store = CallbackStore()
+callback_runner: Any = None
+active_callback_url: Optional[str] = None
+
+
+def format_track_lines(track: dict, index: int) -> str:
+    lines = [
+        f"Track {index}:",
+        f"  ID: {track.get('id', 'N/A')}",
+        f"  Title: {track.get('title', 'N/A')}",
+    ]
+
+    if track.get("status"):
+        lines.append(f"  Status: {track['status']}")
+    if track.get("model_name"):
+        lines.append(f"  Model: {track['model_name']}")
+    if track.get("duration"):
+        lines.append(f"  Duration: {track['duration']}s")
+    if track.get("tags"):
+        lines.append(f"  Tags: {track['tags']}")
+    if track.get("audio_url"):
+        lines.append(f"  Audio URL: {track['audio_url']}")
+    if track.get("stream_audio_url"):
+        lines.append(f"  Stream URL: {track['stream_audio_url']}")
+    if track.get("video_url"):
+        lines.append(f"  Video URL: {track['video_url']}")
+    if track.get("image_url"):
+        lines.append(f"  Image URL: {track['image_url']}")
+    if track.get("create_time") or track.get("created_at"):
+        lines.append(f"  Created: {track.get('create_time') or track.get('created_at')}")
+
+    return "\n".join(lines)
+
+
+def format_tracks_response(tracks: list[dict]) -> str:
+    if not tracks:
+        return "No track details available yet.\n"
+
+    parts = [f"Generated {len(tracks)} track(s):\n"]
+    for index, track in enumerate(tracks, 1):
+        parts.append(format_track_lines(track, index))
+        parts.append("")
+    return "\n".join(parts)
 
 
 @server.list_tools()
@@ -34,7 +81,13 @@ async def handle_list_tools() -> list[Tool]:
     return [
         Tool(
             name="generate_music",
-            description="Generate AI music from a text prompt. Creates high-quality music in various styles and genres. Supports both simple and custom modes with advanced controls. Returns track IDs that can be used to check status and retrieve the generated audio.",
+            description=(
+                "Generate AI music from a text prompt. Creates high-quality music in various styles and genres. "
+                "Supports both simple and custom modes with advanced controls. "
+                "If callback_url is omitted, the server uses its built-in webhook receiver. "
+                "For Docker, publish port 8090 and set SUNO_CALLBACK_PUBLIC_URL to a public URL (e.g. ngrok) "
+                "so Suno can reach the callback endpoint."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -49,9 +102,9 @@ async def handle_list_tools() -> list[Tool]:
                     },
                     "model_version": {
                         "type": "string",
-                        "description": "AI model version to use. V5 offers superior musical expression and faster generation.",
-                        "enum": ["v3.5", "v4", "v4.5", "v4.5plus", "v5"],
-                        "default": "v3.5"
+                        "description": "AI model version to use. V5 and V5_5 offer the best quality and speed.",
+                        "enum": ["v4", "v4.5", "v4.5plus", "v4.5all", "v5", "v5.5"],
+                        "default": "v5"
                     },
                     "custom_mode": {
                         "type": "boolean",
@@ -64,20 +117,25 @@ async def handle_list_tools() -> list[Tool]:
                     },
                     "title": {
                         "type": "string",
-                        "description": "Song title (required in Custom Mode). Max 80 characters."
+                        "description": "Song title (required in Custom Mode). Max 80-100 characters depending on model."
                     },
                     "wait_audio": {
                         "type": "boolean",
-                        "description": "If true, wait for audio generation to complete before returning",
+                        "description": "If true, poll task status until generation completes before returning",
                         "default": True
                     },
                     "callback_url": {
                         "type": "string",
-                        "description": "Webhook URL for completion notification (e.g., 'https://example.com/webhook')"
+                        "description": "Optional webhook URL. If omitted, the MCP server uses its built-in callback endpoint automatically."
                     },
                     "persona_id": {
                         "type": "string",
                         "description": "Persona identifier for stylistic influence (Custom Mode only)"
+                    },
+                    "persona_model": {
+                        "type": "string",
+                        "description": "Persona type when using persona_id",
+                        "enum": ["style_persona", "voice_persona"]
                     },
                     "negative_tags": {
                         "type": "string",
@@ -156,7 +214,7 @@ async def handle_list_tools() -> list[Tool]:
                 "properties": {
                     "callback_url": {
                         "type": "string",
-                        "description": "Webhook URL for conversion completion notification (e.g., 'https://example.com/webhook')"
+                        "description": "Optional webhook URL. If omitted, the MCP server uses its built-in callback endpoint automatically."
                     },
                     "task_id": {
                         "type": "string",
@@ -164,10 +222,10 @@ async def handle_list_tools() -> list[Tool]:
                     },
                     "audio_id": {
                         "type": "string",
-                        "description": "Track ID (audioId) from music['data']['sunoData'][0]['id'] - UUID identifying the specific track to convert (REQUIRED)"
+                        "description": "Track ID (audioId) from track results - UUID identifying the specific track to convert (REQUIRED)"
                     }
                 },
-                "required": ["callback_url", "task_id", "audio_id"]
+                "required": ["task_id", "audio_id"]
             }
         ),
         Tool(
@@ -193,22 +251,14 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
     if not suno_client:
         raise RuntimeError("Suno client not initialized")
 
+    arguments = arguments or {}
+
     try:
         if name == "generate_music":
-            # Extract arguments
             prompt = arguments.get("prompt")
             make_instrumental = arguments.get("make_instrumental", False)
-            model_version = arguments.get("model_version", "v3.5")
-
-            # Convert model version format from "v3.5" to "V3_5" for API
-            model_version_map = {
-                "v3.5": "V3_5",
-                "v4": "V4",
-                "v4.5": "V4_5",
-                "v4.5plus": "V4_5PLUS",
-                "v5": "V5"
-            }
-            api_model_version = model_version_map.get(model_version, "V3_5")
+            model_version = arguments.get("model_version", "v5")
+            api_model_version = SunoClient.map_model_version(model_version)
 
             custom_mode = arguments.get("custom_mode", False)
             style = arguments.get("style")
@@ -216,13 +266,13 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
             wait_audio = arguments.get("wait_audio", True)
             callback_url = arguments.get("callback_url")
             persona_id = arguments.get("persona_id")
+            persona_model = arguments.get("persona_model")
             negative_tags = arguments.get("negative_tags")
             vocal_gender = arguments.get("vocal_gender")
             style_weight = arguments.get("style_weight")
             weirdness_constraint = arguments.get("weirdness_constraint")
             audio_weight = arguments.get("audio_weight")
 
-            # Generate music
             result = await suno_client.generate_music(
                 prompt=prompt,
                 make_instrumental=make_instrumental,
@@ -233,106 +283,58 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
                 title=title,
                 callback_url=callback_url,
                 persona_id=persona_id,
+                persona_model=persona_model,
                 negative_tags=negative_tags,
                 vocal_gender=vocal_gender,
                 style_weight=style_weight,
                 weirdness_constraint=weirdness_constraint,
-                audio_weight=audio_weight
+                audio_weight=audio_weight,
+                callback_store=callback_store,
             )
 
-            # Format response
+            used_callback_url = callback_url or active_callback_url or resolve_callback_url()
             response_text = f"Music generation {'completed' if wait_audio else 'started'}!\n\n"
+            response_text += f"Callback URL: {used_callback_url}\n\n"
 
-            if "data" in result and result["data"] is not None:
-                data = result["data"]
+            data = result.get("data")
+            if isinstance(data, dict):
+                task_id = data.get("taskId") or extract_generation_task_id(result)
+                if task_id:
+                    response_text += f"Task ID: {task_id}\n"
 
-                # Check if data is a dict with taskId (async generation)
-                if isinstance(data, dict) and "taskId" in data:
-                    response_text += f"Task ID: {data['taskId']}\n"
-                    response_text += "\nNote: Generation is processing asynchronously. You can check status later using the task ID.\n"
-                # Check if data is a list of tracks (completed generation)
-                elif isinstance(data, list):
-                    tracks = data
-                    response_text += f"Generated {len(tracks)} track(s):\n\n"
-
-                    for i, track in enumerate(tracks, 1):
-                        response_text += f"Track {i}:\n"
-                        response_text += f"  ID: {track.get('id', 'N/A')}\n"
-                        response_text += f"  Title: {track.get('title', 'N/A')}\n"
-                        response_text += f"  Status: {track.get('status', 'N/A')}\n"
-
-                        if track.get('audio_url'):
-                            response_text += f"  Audio URL: {track['audio_url']}\n"
-                        if track.get('video_url'):
-                            response_text += f"  Video URL: {track['video_url']}\n"
-                        if track.get('duration'):
-                            response_text += f"  Duration: {track['duration']}s\n"
-
-                        response_text += "\n"
-
-                    if not wait_audio:
-                        response_text += "Note: Use get_music_info with the track IDs above to check generation status and retrieve audio URLs.\n"
-                else:
-                    response_text += f"Data: {data}\n"
+                tracks = data.get("tracks")
+                if tracks:
+                    response_text += "\n" + format_tracks_response(tracks)
+                elif not wait_audio:
+                    response_text += (
+                        "\nNote: Generation is processing asynchronously. "
+                        "Use get_task_status with the task ID to check progress.\n"
+                    )
+                elif wait_audio:
+                    response_text += "\nGeneration finished but no track details were returned yet.\n"
             else:
                 response_text += f"Response: {result}\n"
 
             return [TextContent(type="text", text=response_text)]
 
         elif name == "get_task_status":
-            # Extract task ID
             task_id = arguments.get("task_id")
             if not task_id:
                 raise ValueError("task_id is required")
 
-            # Get task status
             result = await suno_client.get_task_status(task_id)
-
-            # Format response
             response_text = "Music Generation Task Status:\n\n"
 
             if "data" in result:
                 data = result["data"]
-
                 response_text += f"Task ID: {data.get('taskId', 'N/A')}\n"
                 response_text += f"Status: {data.get('status', 'N/A')}\n"
                 response_text += f"Operation: {data.get('operationType', 'N/A')}\n"
                 response_text += f"Model: {data.get('type', 'N/A')}\n"
 
-                # Check if response contains track data
-                response_data = data.get('response')
-                suno_data = []
-                if response_data and isinstance(response_data, dict):
-                    suno_data = response_data.get('sunoData', [])
-
-                if suno_data:
-                    response_text += f"\n{len(suno_data)} track(s) generated:\n\n"
-
-                    for i, track in enumerate(suno_data, 1):
-                        response_text += f"Track {i}:\n"
-                        response_text += f"  ID: {track.get('id', 'N/A')}\n"
-                        response_text += f"  Title: {track.get('title', 'N/A')}\n"
-                        response_text += f"  Model: {track.get('modelName', 'N/A')}\n"
-
-                        if track.get('duration'):
-                            response_text += f"  Duration: {track['duration']}s\n"
-
-                        if track.get('tags'):
-                            response_text += f"  Tags: {track['tags']}\n"
-
-                        if track.get('audioUrl'):
-                            response_text += f"  Audio URL: {track['audioUrl']}\n"
-
-                        if track.get('streamAudioUrl'):
-                            response_text += f"  Stream URL: {track['streamAudioUrl']}\n"
-
-                        if track.get('imageUrl'):
-                            response_text += f"  Image URL: {track['imageUrl']}\n"
-
-                        if track.get('createTime'):
-                            response_text += f"  Created: {track['createTime']}\n"
-
-                        response_text += "\n"
+                tracks = extract_tracks_from_container(data)
+                if tracks:
+                    response_text += "\n" + format_tracks_response(tracks)
                 else:
                     response_text += f"\nGeneration in progress. Current status: {data.get('status', 'UNKNOWN')}\n"
             else:
@@ -341,62 +343,36 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
             return [TextContent(type="text", text=response_text)]
 
         elif name == "get_music_info":
-            # Extract track IDs
             track_ids = arguments.get("track_ids")
             if not track_ids or not isinstance(track_ids, list):
                 raise ValueError("track_ids must be a non-empty list")
 
-            # Get music info
             result = await suno_client.get_music_info(track_ids)
-
-            # Format response
             response_text = "Music Track Information:\n\n"
 
             if "data" in result:
-                tracks = result["data"]
-
-                for i, track in enumerate(tracks, 1):
-                    response_text += f"Track {i}:\n"
-                    response_text += f"  ID: {track.get('id', 'N/A')}\n"
-                    response_text += f"  Title: {track.get('title', 'N/A')}\n"
-                    response_text += f"  Status: {track.get('status', 'N/A')}\n"
-                    response_text += f"  Model: {track.get('model_name', 'N/A')}\n"
-
-                    if track.get('audio_url'):
-                        response_text += f"  Audio URL: {track['audio_url']}\n"
-                    if track.get('video_url'):
-                        response_text += f"  Video URL: {track['video_url']}\n"
-                    if track.get('image_url'):
-                        response_text += f"  Image URL: {track['image_url']}\n"
-
-                    if track.get('duration'):
-                        response_text += f"  Duration: {track['duration']}s\n"
-                    if track.get('tags'):
-                        response_text += f"  Tags: {track['tags']}\n"
-                    if track.get('prompt'):
-                        response_text += f"  Prompt: {track['prompt']}\n"
-
-                    response_text += f"  Created: {track.get('created_at', 'N/A')}\n"
-                    response_text += "\n"
+                raw_tracks = result["data"]
+                if isinstance(raw_tracks, list):
+                    tracks = [normalize_track(track) for track in raw_tracks]
+                    response_text += format_tracks_response(tracks)
+                    if tracks and tracks[0].get("prompt"):
+                        response_text += f"Prompt: {tracks[0]['prompt']}\n"
+                else:
+                    response_text += f"Data: {raw_tracks}\n"
             else:
                 response_text += f"Response: {result}\n"
 
             return [TextContent(type="text", text=response_text)]
 
         elif name == "get_credits":
-            # Get credit info
             result = await suno_client.get_credits()
-
-            # Format response
             response_text = "Suno API Credits:\n\n"
 
             if "data" in result:
                 data = result["data"]
-                # The API returns credits as a simple float value
                 if isinstance(data, (int, float)):
                     response_text += f"Remaining Credits: {data}\n"
                 else:
-                    # Handle if the API format changes to return detailed breakdown
                     response_text += f"Total Credits: {data.get('total_credits', 'N/A')}\n"
                     response_text += f"Used Credits: {data.get('used_credits', 'N/A')}\n"
                     response_text += f"Remaining Credits: {data.get('remaining_credits', 'N/A')}\n"
@@ -406,34 +382,29 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
             return [TextContent(type="text", text=response_text)]
 
         elif name == "convert_to_wav":
-            # Extract arguments
             callback_url = arguments.get("callback_url")
             task_id = arguments.get("task_id")
             audio_id = arguments.get("audio_id")
-
-            if not callback_url:
-                raise ValueError("callback_url is required")
 
             if not task_id:
                 raise ValueError("task_id is required (generation job ID from music['data']['taskId'])")
 
             if not audio_id:
-                raise ValueError("audio_id is required (track ID from music['data']['sunoData'][0]['id'])")
+                raise ValueError("audio_id is required (track ID from generated track results)")
 
-            # Convert to WAV (BOTH IDs required per Suno API)
             result = await suno_client.convert_to_wav(
-                callback_url=callback_url,
                 task_id=task_id,
-                audio_id=audio_id
+                audio_id=audio_id,
+                callback_url=callback_url or active_callback_url or resolve_callback_url(),
             )
 
-            # Format response
             response_text = "WAV Conversion Started!\n\n"
+            used_callback_url = callback_url or active_callback_url or resolve_callback_url()
+            response_text += f"Callback URL: {used_callback_url}\n\n"
 
             if "data" in result and result["data"] is not None:
                 data = result["data"]
 
-                # Check if data contains taskId
                 if isinstance(data, dict) and "taskId" in data:
                     conversion_task_id = data['taskId']
                     response_text += f"🎵 WAV Conversion Initiated\n\n"
@@ -461,15 +432,11 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
             return [TextContent(type="text", text=response_text)]
 
         elif name == "get_wav_conversion_status":
-            # Extract task ID
             task_id = arguments.get("task_id")
             if not task_id:
                 raise ValueError("task_id is required")
 
-            # Get WAV conversion status
             result = await suno_client.get_wav_conversion_status(task_id)
-
-            # Format response
             response_text = "WAV Conversion Task Status:\n\n"
 
             if "data" in result and result["data"] is not None:
@@ -479,7 +446,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
                 response_text += f"Music ID: {data.get('musicId', 'N/A')}\n"
                 response_text += f"Status: {data.get('successFlag', 'N/A')}\n"
 
-                # Check if conversion is complete and has WAV URL
                 response_data = data.get('response')
                 if response_data and isinstance(response_data, dict):
                     wav_url = response_data.get('audioWavUrl')
@@ -492,14 +458,12 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
                         if data.get('createTime'):
                             response_text += f"Created: {data['createTime']}\n"
                     else:
-                        # Conversion still in progress
                         response_text += f"\n⏳ Conversion in progress...\n"
                         response_text += f"Current Status: {data.get('successFlag', 'PENDING')}\n"
                 else:
                     response_text += f"\n⏳ Conversion in progress...\n"
                     response_text += f"Current Status: {data.get('successFlag', 'PENDING')}\n"
 
-                # Show errors if any
                 if data.get('errorCode') or data.get('errorMessage'):
                     response_text += f"\n⚠️ Error Details:\n"
                     response_text += f"Error Code: {data.get('errorCode', 'N/A')}\n"
@@ -520,18 +484,15 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
 
 async def main():
     """Run the MCP server."""
-    global suno_client
+    global suno_client, callback_runner, active_callback_url
 
-    # Initialize Suno client
     try:
         suno_client = SunoClient()
-        # Successfully initialized - do not print to stdout as it corrupts MCP JSON-RPC protocol
-    except Exception as e:
-        # Failed to initialize - exit silently to avoid corrupting MCP protocol
-        # Error will be reported when tools are called
+    except Exception:
         return
 
-    # Run the server
+    callback_runner, active_callback_url = await start_callback_server(callback_store)
+
     async with stdio_server() as (read_stream, write_stream):
         try:
             await server.run(
@@ -539,7 +500,7 @@ async def main():
                 write_stream,
                 InitializationOptions(
                     server_name="suno-mcp-server",
-                    server_version="1.0.0",
+                    server_version="1.1.0",
                     capabilities=server.get_capabilities(
                         notification_options=NotificationOptions(),
                         experimental_capabilities={},
@@ -549,6 +510,8 @@ async def main():
         finally:
             if suno_client:
                 await suno_client.close()
+            if callback_runner:
+                await callback_runner.cleanup()
 
 
 if __name__ == "__main__":
