@@ -305,7 +305,9 @@ Add to your MCP settings file:
 
 ## Available Tools
 
-The server exposes 6 MCP tools for music generation and management:
+The server exposes 15 MCP tools for music generation and management:
+
+### Core tools (6)
 
 ### 1. generate_music
 
@@ -470,6 +472,20 @@ wav_url = status['data']['response']['audioWavUrl']
 - Use the **conversion task_id** (returned from `convert_to_wav`)
 - Do NOT use the generation task_id (from `generate_music`) - it will not work
 - Do NOT use the audio_id - the API does not support querying by audio_id
+
+### P1 tools (9)
+
+| Tool | Description |
+|------|-------------|
+| `generate_lyrics` | Generate lyrics only (no audio) |
+| `get_lyrics_status` | Poll lyrics generation task |
+| `extend_music` | Extend an existing track |
+| `separate_vocals` | Vocal/instrument stem separation |
+| `get_vocal_separation_status` | Poll stem separation task |
+| `create_music_video` | Generate MP4 video from a track |
+| `get_music_video_status` | Poll video generation task |
+| `generate_persona` | Create reusable style persona from a track |
+| `upload_and_cover_audio` | Restyle audio from a public upload URL |
 
 ## Example Workflows
 
@@ -690,7 +706,7 @@ docker run --rm -i --env-file .env suno-mcp-server:latest python healthcheck.py
 
 ### Server Information
 - **Server Name**: `suno-mcp-server`
-- **Version**: 1.0.0
+- **Version**: 1.2.0
 - **Protocol**: Model Context Protocol (MCP)
 - **API**: Suno API v1
 - **Python Version**: 3.10+
