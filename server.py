@@ -20,7 +20,9 @@ from mcp.types import (
 from callback_server import resolve_callback_url, start_callback_server
 from callback_store import CallbackStore
 from suno_client import SunoClient, SunoAPIError
+from mcp_p1 import get_p1_tools, handle_p1_tool
 from suno_response import extract_generation_task_id, extract_tracks_from_container, normalize_track
+from tool_formatters import format_tracks_response
 
 # Load environment variables
 load_dotenv()
@@ -33,46 +35,6 @@ suno_client: SunoClient | None = None
 callback_store = CallbackStore()
 callback_runner: Any = None
 active_callback_url: Optional[str] = None
-
-
-def format_track_lines(track: dict, index: int) -> str:
-    lines = [
-        f"Track {index}:",
-        f"  ID: {track.get('id', 'N/A')}",
-        f"  Title: {track.get('title', 'N/A')}",
-    ]
-
-    if track.get("status"):
-        lines.append(f"  Status: {track['status']}")
-    if track.get("model_name"):
-        lines.append(f"  Model: {track['model_name']}")
-    if track.get("duration"):
-        lines.append(f"  Duration: {track['duration']}s")
-    if track.get("tags"):
-        lines.append(f"  Tags: {track['tags']}")
-    if track.get("audio_url"):
-        lines.append(f"  Audio URL: {track['audio_url']}")
-    if track.get("stream_audio_url"):
-        lines.append(f"  Stream URL: {track['stream_audio_url']}")
-    if track.get("video_url"):
-        lines.append(f"  Video URL: {track['video_url']}")
-    if track.get("image_url"):
-        lines.append(f"  Image URL: {track['image_url']}")
-    if track.get("create_time") or track.get("created_at"):
-        lines.append(f"  Created: {track.get('create_time') or track.get('created_at')}")
-
-    return "\n".join(lines)
-
-
-def format_tracks_response(tracks: list[dict]) -> str:
-    if not tracks:
-        return "No track details available yet.\n"
-
-    parts = [f"Generated {len(tracks)} track(s):\n"]
-    for index, track in enumerate(tracks, 1):
-        parts.append(format_track_lines(track, index))
-        parts.append("")
-    return "\n".join(parts)
 
 
 @server.list_tools()
@@ -241,7 +203,8 @@ async def handle_list_tools() -> list[Tool]:
                 },
                 "required": ["task_id"]
             }
-        )
+        ),
+        *get_p1_tools(),
     ]
 
 
@@ -254,6 +217,16 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[TextConten
     arguments = arguments or {}
 
     try:
+        p1_result = await handle_p1_tool(
+            name,
+            arguments,
+            suno_client,
+            callback_store,
+            active_callback_url,
+        )
+        if p1_result is not None:
+            return p1_result
+
         if name == "generate_music":
             prompt = arguments.get("prompt")
             make_instrumental = arguments.get("make_instrumental", False)
@@ -500,7 +473,7 @@ async def main():
                 write_stream,
                 InitializationOptions(
                     server_name="suno-mcp-server",
-                    server_version="1.1.0",
+                    server_version="1.2.0",
                     capabilities=server.get_capabilities(
                         notification_options=NotificationOptions(),
                         experimental_capabilities={},

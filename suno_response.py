@@ -18,6 +18,22 @@ TERMINAL_FAILURE_STATUSES = {
     "CREATE_TASK_FAILED",
 }
 
+LYRICS_SUCCESS_STATUSES = {"SUCCESS"}
+LYRICS_FAILURE_STATUSES = {
+    "CREATE_TASK_FAILED",
+    "GENERATE_LYRICS_FAILED",
+    "CALLBACK_EXCEPTION",
+    "SENSITIVE_WORD_ERROR",
+}
+
+PROCESSING_SUCCESS_FLAGS = {"SUCCESS"}
+PROCESSING_FAILURE_FLAGS = {
+    "CREATE_TASK_FAILED",
+    "GENERATE_AUDIO_FAILED",
+    "GENERATE_MP4_FAILED",
+    "CALLBACK_EXCEPTION",
+}
+
 
 def normalize_track(track: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize camelCase and snake_case track fields."""
@@ -90,3 +106,56 @@ def extract_generation_task_id(result: Dict[str, Any]) -> Optional[str]:
     if isinstance(data, dict):
         return data.get("taskId") or data.get("task_id")
     return None
+
+
+def extract_lyrics_from_container(container: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not container or not isinstance(container, dict):
+        return []
+
+    response = container.get("response")
+    if isinstance(response, dict):
+        raw_lyrics = response.get("data")
+        if isinstance(raw_lyrics, list):
+            return [
+                {
+                    "title": item.get("title"),
+                    "text": item.get("text"),
+                    "status": item.get("status"),
+                    "error_message": item.get("errorMessage"),
+                }
+                for item in raw_lyrics
+            ]
+
+    raw_lyrics = container.get("data")
+    if isinstance(raw_lyrics, list) and raw_lyrics and isinstance(raw_lyrics[0], dict) and "text" in raw_lyrics[0]:
+        return [
+            {
+                "title": item.get("title"),
+                "text": item.get("text"),
+                "status": item.get("status"),
+                "error_message": item.get("errorMessage"),
+            }
+            for item in raw_lyrics
+        ]
+
+    return []
+
+
+def is_lyrics_success(status: Optional[str], lyrics: List[Dict[str, Any]]) -> bool:
+    if (status or "").upper() in LYRICS_SUCCESS_STATUSES:
+        return True
+    return bool(lyrics) and any(item.get("text") for item in lyrics)
+
+
+def is_lyrics_failure(status: Optional[str]) -> bool:
+    return (status or "").upper() in LYRICS_FAILURE_STATUSES
+
+
+def is_processing_success(flag: Optional[str], result_url: Optional[str] = None) -> bool:
+    if (flag or "").upper() in PROCESSING_SUCCESS_FLAGS:
+        return True
+    return bool(result_url)
+
+
+def is_processing_failure(flag: Optional[str]) -> bool:
+    return (flag or "").upper() in PROCESSING_FAILURE_FLAGS
