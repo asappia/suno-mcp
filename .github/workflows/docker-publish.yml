@@ -51,7 +51,9 @@ jobs:
             # Tag with major version on tag pushes (e.g., v1.0.0 -> 1)
             type=semver,pattern={{major}}
             # Tag with commit SHA for traceability
-            type=sha,prefix={{branch}}-
+            # {{branch}} is empty on pull_request (detached merge ref), so use pr- prefix there
+            type=sha,prefix={{branch}}-,enable=${{ github.event_name != 'pull_request' }}
+            type=sha,prefix=pr-,enable=${{ github.event_name == 'pull_request' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
